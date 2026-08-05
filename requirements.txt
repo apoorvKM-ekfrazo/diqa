@@ -1,0 +1,7 @@
+opencv-python
+numpy
+PyMuPDF
+Pillow
+streamlit
+openai
+python-dotenv
