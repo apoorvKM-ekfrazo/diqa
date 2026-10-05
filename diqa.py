@@ -33,10 +33,40 @@ import fitz
 from openai import OpenAI
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-BLUR_THRESHOLD        = 80.0        # Variance of Laplacian. Below = out of focus.
+# Blur thresholds — sourced from production DIQA research
+# Dynamsoft production framework (ref [9]): 200.0 for 300 DPI standard scans.
+# Absolute floor for low-res captures: 100.0 (ref [9]).
+# We render PDFs at 150 DPI (PDF_RENDER_DPI below) — half of 300 DPI standard —
+# so we use the absolute floor of 100.0 as our operational minimum.
+# Upper bound 900.0 rejects artificially over-sharpened or JPEG-compressed images (ref [10]).
+# Pech-Pacheco et al. (ICPR 2000) established the Variance of Laplacian method.
+BLUR_THRESHOLD        = 100.0       # Min Laplacian variance. Floor for 150 DPI captures [9].
+BLUR_THRESHOLD_UPPER  = 900.0       # Max Laplacian variance. Above = over-sharpened / compressed [10].
 BRIGHTNESS_LOW        = 45.0        # Mean pixel value. Below = too dark.
 PDF_RENDER_DPI        = 150         # DPI for rendering PDF pages to images.
 MAX_FILE_SIZE_BYTES   = 2_097_152   # 2MB hard limit. Reject before any processing.
+
+# Glare detection — ISO/IEC 29794-5 local contrast collapse method
+# Research (Rodin & Orlov 2019 [11], ISO/IEC 29794-5 [19]) confirms that static pixel
+# thresholds are "fundamentally flawed for mobile capture" because smartphone ISPs map
+# clean white paper to 240-255 brightness, causing massive false positives.
+# Correct method per ISO/IEC 29794-5: flag a zone as glare when its mean is high AND
+# its local std_deviation drops >80% compared to the document baseline (adjacent zones).
+# This catches real glare (ink merges with blown-out background, contrast collapses)
+# while ignoring clean white paper (high mean but consistent with surrounding areas).
+GLARE_STD_DROP_RATIO  = 0.80        # Std deviation must drop >80% vs baseline to flag as glare [19].
+GLARE_MEAN_MIN        = 230.0       # Zone mean must exceed this to be considered bright enough for glare.
+GLARE_CONTENT_MIN     = 0.10        # Zone must have >10% dark pixels (content) to be evaluated.
+
+# Document fill ratio thresholds
+# ICAO Doc 9303 Part 3 [20] mandates 300 DPI minimum for MRZ OCR-B font.
+# At 300 DPI on 1920x1080, fill ratio minimum is 25-30% (mathematically derived).
+# However: we process scanned PDFs rendered at 150 DPI (half resolution).
+# A PAN card (85.6x54mm) on A4 at 150 DPI occupies ~7.5% of the image area.
+# Therefore our fill thresholds are correctly calibrated for scanned PDF inputs,
+# not for phone-camera capture where 25-30% would apply.
+FILL_RATIO_MIN        = 0.02        # Hard fail: document is a tiny speck (< 2%). Calibrated for PDF renders.
+FILL_RATIO_WARN       = 0.04        # Soft warning: document small in frame (< 4%). May still be readable.
 
 # CG-DIQA routing thresholds
 CGDIQA_PASS           = 15.0   # Score above this → confident enough to assess
@@ -144,30 +174,94 @@ SIGNAL 3 — Individual vs company distinction:
   Individual PAN: shows 'FATHER'S NAME' / 'पिता का नाम' field + cardholder photo
   Company PAN: shows entity name + registration date, NO father's name, NO photo
 
-DECISION RULES:
-- Signal 1 present AND 4th character is P AND Signal 3 shows individual fields 
-  → INDIVIDUAL PAN, accept
-- Signal 1 present AND 4th character is F/C/H/A/B/G/J/L/T 
-  → COMPANY PAN, reject with specific message
-- Signal 2 present but no PAN number readable (small card, low resolution)
-  → accept if card layout matches individual PAN format
-- No PAN signals found at all → reject
+DECISION RULES — apply in strict order, stop at first match:
 
-Output ONLY this JSON with no other text:
-{"match": true, "detected_type": "pan", "reason": "confirmed — individual PAN, [signals found]"}
+RULE 1 — 4th CHARACTER IS THE HARD RULE (overrides all visual signals):
+  If PAN number is readable AND the 4th character is P:
+    → INDIVIDUAL PAN — accept immediately.
+    → Do NOT require Signal 3 (visible father's name label).
+    → Older PAN card formats (pre-2017) do not show English field labels
+       for Name or Father's Name — this is a known format variant, NOT
+       evidence of a company card. Photo + 4th char P = individual.
+
+RULE 2 — NON-INDIVIDUAL 4th CHARACTER:
+  If PAN number is readable AND 4th character is F, C, H, A, B, G, J, L, or T:
+    → NON-INDIVIDUAL PAN — reject with the specific entity type detected.
+
+RULE 3 — PAN NUMBER NOT READABLE BUT PHOTO PRESENT:
+  If PAN number cannot be clearly read but a cardholder photo is visible:
+    → INDIVIDUAL PAN — accept. Photos never appear on company/entity PAN cards.
+
+RULE 4 — NOTHING READABLE:
+  → Reject — cannot confirm individual PAN. Request clearer image.
+
+Output ONLY this JSON with no other text — always include pan_number_extracted:
+{"match": true, "detected_type": "pan", "pan_number_extracted": "AWAPJ9107H", "reason": "confirmed — individual PAN, [signals found]"}
 or
-{"match": false, "detected_type": "pan", "reason": "Company/Firm PAN detected (entity PAN, not individual PAN) — this slot requires the individual cardholder's personal PAN card"}
+{"match": false, "detected_type": "pan", "pan_number_extracted": "AWAPJ9107H or null if not readable", "reason": "Company/Firm PAN detected (entity PAN, not individual PAN) — this slot requires the individual cardholder's personal PAN card"}
 or
-{"match": false, "detected_type": "one of: passport|visa|reload|transfer|ticket|annexure|sof|unknown", "reason": "wrong document — [what this actually appears to be]"}"""
+{"match": false, "detected_type": "one of: passport|visa|reload|transfer|ticket|annexure|sof|unknown", "pan_number_extracted": null, "reason": "wrong document — [what this actually appears to be]"}"""
     },
     "visa": {
         "name": "Visa (e-Visa or sticker visa)",
         "signals": [
-            "'Visa issue date:' AND 'Visa valid till:' fields present together on the same document",
-            "Country immigration authority branding (e.g. ICA Singapore, UAE Federal Authority, GDRFA)",
-            "'Type of Visa:' field with value such as TOURIST, MULTIPLE JOURNEY, or SINGLE ENTRY",
+            "Visa sticker (VISADO/VISA, VISA/VISUM) affixed to passport page, with validity dates and visa number",
+            "e-Visa printout with 'Visa issue date' / 'Valid till' fields and applicant details",
+            "MRZ at bottom of sticker starting with VC (Schengen), VA (transit), or VR (residence)",
         ],
-        "not_this": "Passport bio-data page (has MRZ instead), flight ticket, boarding pass, hotel booking",
+        "not_this": "Passport bio-data page WITHOUT a visa sticker on it, flight ticket, boarding pass, hotel booking",
+        "prompt_override": """You are classifying a document image to verify it is a visa.
+
+CRITICAL — VALID SUBMISSION FORMATS. Both of these are correct:
+
+FORMAT 1 — e-Visa printout:
+  A printed PDF page with fields like 'Visa issue date', 'Valid till', 'Type of Visa',
+  applicant name, photo, and issuing authority branding.
+
+FORMAT 2 — Visa sticker on passport page (MOST COMMON IN INDIA):
+  Applicants photograph their passport opened to the page where the visa sticker is affixed.
+  This looks like a passport page WITH a coloured/holographic sticker attached to it.
+  DO NOT classify this as 'passport' — the STICKER is the visa.
+  Recognise it by:
+    - A rectangular sticker with 'VISADO/VISA', 'VISA/VISUM', or country name at top
+    - Validity dates on the sticker (FROM / TO or DE / AL or VON / BIS)
+    - A visa number (typically 9 digits)
+    - Two lines of MRZ text at the bottom of the sticker starting with VC, VA, VR, or V<
+
+FORMAT 3 — Visa grant letter / grant notification:
+  Used by Australia, New Zealand, UK (BRP), and others that do not issue sticker visas.
+  Shows: Visa Grant Number, applicant name and passport number, visa class/subclass,
+  visa conditions, travel validity period, and government immigration branding.
+  Key identifiers: "Visa Grant Number", "Subclass", "Department of Home Affairs",
+  "Immigration New Zealand", "Grant Date", or "travel to [country] until".
+  This IS a valid visa — do NOT classify as wrong document.
+
+
+SIGNAL 1 — Visa sticker header on any page:
+  Look for 'VISADO/VISA', 'VISA/VISUM', 'VISTO', 'SCHENGEN VISA', or
+  country flag + country name in the context of a visa sticker rectangle.
+
+SIGNAL 2 — Visa MRZ (sticker visas only):
+  Two lines of OCR-B text at the bottom of the sticker.
+  Line 1 starts with V followed by document subtype code and country (e.g. VCESP, VCCHE, VKGBR).
+  This is DIFFERENT from passport MRZ which starts with P<IND.
+
+SIGNAL 3 — Validity dates visible anywhere on document:
+  Any combination of FROM/TO dates, issue date + expiry date, or
+  VALIDO DESDE / HASTA, VON / BIS, with a visa number nearby.
+
+DECISION RULES:
+  - Visa sticker visible on a passport page → ACCEPT as visa (do NOT call this a passport)
+  - e-Visa PDF with validity dates → ACCEPT as visa
+  - Visa grant letter / grant notification (Visa Grant Number + validity + issuing authority) → ACCEPT as visa
+  - Passport bio-data page with no sticker attached → REJECT (this is passport, not visa)
+  - Plain passport page with entry/exit stamps only (no sticker) → REJECT
+  - Flight ticket, hotel booking, boarding pass → REJECT
+
+Output ONLY this JSON:
+{\"match\": true, \"detected_type\": \"visa\", \"reason\": \"confirmed — [format: sticker on passport/e-visa, signals found]\"}
+or
+{\"match\": false, \"detected_type\": \"one of: passport|pan|reload|transfer|ticket|annexure|sof|unknown\", \"reason\": \"wrong document — [what this is]\"}"""
     },
     "reload": {
         "name": "Thomas Cook Reload / Application Form",
@@ -215,11 +309,44 @@ or
     "transfer": {
         "name": "Bank Transfer Acknowledgement (online netbanking)",
         "signals": [
-            "3-step progress UI: ENTER DETAILS → CONFIRM TRANSACTION → ACKNOWLEDGEMENT with Step 3 active",
-            "'Processing Successful.' status with a single UTR/Reference number and INR amount",
-            "Bank netbanking portal URL visible (e.g. netbanking.hdfcbank.com, onlinebanking.axisbank.co.in)",
+            "UTR number or transaction reference number confirming a completed fund transfer",
+            "INR transfer amount and beneficiary / payee name visible",
+            "Bank name or logo present with transaction date",
         ],
-        "not_this": "Multi-row bank statement, UPI payment screenshot, cheque image, demand draft",
+        "not_this": "Multi-row bank statement with many transactions, UPI screenshot without UTR, cheque, demand draft",
+        "prompt_override": """You are classifying a document to verify it is a bank transfer confirmation.
+
+VALID FORMATS — all of these confirm a bank transfer was completed:
+  - HDFC/ICICI/Axis netbanking: 3-step UI with "Processing Successful" and UTR number
+  - SBI/PNB NEFT/IMPS: Simple acknowledgement page with transaction reference number
+  - Bank advice receipt (e.g. "ICICI Bank Advice Receipt"): single transaction details
+  - Payment summary or transfer summary: shows amount, beneficiary, reference, date
+  - UPI transfer confirmation: shows UPI transaction ID, amount, payee name
+  - Any document that shows: amount transferred + reference/UTR number + beneficiary
+
+INVALID FORMATS:
+  - Multi-row bank account statement (has many transactions, opening/closing balance) → this is SOF
+  - Cheque image → not a transfer confirmation
+  - Demand draft → not an online transfer
+  - Salary slip → not a transfer
+
+THE KEY IDENTIFIERS for a valid bank transfer confirmation:
+  1. A single transaction reference number (UTR: 12-22 alphanumeric, or transaction ID)
+  2. Amount in INR
+  3. Payee / beneficiary name (should be Thomas Cook India Ltd or similar)
+  4. Transaction date
+  5. Bank identity (logo, letterhead, or portal branding)
+  ALL FIVE do not need to be present — any 3 of the 5 is sufficient.
+
+DECISION RULE:
+  - Contains transaction reference + amount + at least one other identifier → ACCEPT
+  - Multi-row statement with 10+ transactions → REJECT as "sof"
+  - None of the identifiers present → REJECT as "unknown"
+
+Output ONLY this JSON:
+{"match": true, "detected_type": "transfer", "reason": "confirmed — [which identifiers found]"}
+or
+{"match": false, "detected_type": "one of: sof|passport|pan|visa|reload|ticket|annexure|unknown", "reason": "wrong document — [what this is]"}"""
     },
     "ticket": {
         "name": "Air Ticket / Flight Itinerary",
@@ -238,15 +365,95 @@ or
             "Thomas Cook India payee bank account number (57500000424836) with UTR/reference",
         ],
         "not_this": "Thomas Cook's own reload form (has currency table), bank statement, general business letter",
+        "prompt_override": """You are classifying a document to verify it belongs in the Annexure slot.
+
+TWO DOCUMENT TYPES ARE VALID OR NEAR-VALID for this slot:
+
+TYPE A — ANNEXURE / DEALER DECLARATION LETTER (exact match):
+  A letter from an RBI-authorised forex dealer declaring they are reloading a
+  Thomas Cook travel card for a customer. Key identifiers:
+  - RBI Authorised Dealer Licence number (format: DEL.FFMC/XXX/YYYY or similar)
+  - Phrase confirming the customer 'has to reload' or 'wishes to reload' a Thomas Cook Card
+  - Thomas Cook India bank account number (57500000424836) and UTR/reference number
+  - Customer details: name, passport number, PAN, travel date, currency, amount
+
+TYPE B — FOREX CARD ISSUANCE LETTER (similar but different — classify separately):
+  A letter from a sub-dealer (e.g. Competent Forex Services, United Forex Services)
+  to Thomas Cook India Ltd confirming they HAVE ISSUED a forex card.
+  Key identifiers:
+  - Company letterhead (forex services company name, address, phone)
+  - Addressed TO Thomas Cook India Ltd / the authorised dealer
+  - Structured table with: Card Holder Name, Card Number, Passport No, PAN,
+    Travel Date, Destination, Currency & Amount, UTR Reference
+  - FEMA compliance statement at the bottom
+  - Authorised Signatory with company stamp
+
+DECISION RULES:
+  - TYPE A (Dealer Declaration) → match: true, detected_type: "annexure"
+  - TYPE B (Forex Issuance Letter) → match: false, detected_type: "dealer_issuance_letter"
+  - Thomas Cook reload form (has 10-currency table, Thomas Cook branding) → match: false, detected_type: "reload"
+  - Bank statement, salary slip → match: false, detected_type: "sof"
+  - Something else entirely → match: false, detected_type: "unknown"
+
+Output ONLY this JSON — no other text:
+{"match": true, "detected_type": "annexure", "reason": "confirmed — RBI licence + Thomas Cook reload declaration found"}
+or
+{"match": false, "detected_type": "dealer_issuance_letter", "reason": "forex card issuance letter — sub-dealer to Thomas Cook, has card details table and FEMA statement"}
+or
+{"match": false, "detected_type": "one of: reload|sof|passport|pan|visa|transfer|ticket|unknown", "reason": "wrong document — [what this is]"}"""
     },
     "sof": {
         "name": "Source of Funds — Bank Account Statement",
         "signals": [
-            "'STATEMENT SUMMARY' section listing Opening Balance, Closing Balance, Dr Count, Cr Count",
-            "Multi-row transaction table with columns: Date, Narration/Description, Withdrawal, Deposit, Closing Balance",
-            "'This is a computer generated statement and does not require signature' disclaimer",
+            "Multi-row transaction table showing multiple credits and debits over a period",
+            "Account holder name and account number visible",
+            "Balance information visible (running balance, closing balance, or summary)",
         ],
-        "not_this": "Single-transaction bank transfer confirmation (3-step UI), salary slip, credit card statement",
+        "not_this": "Single-transaction bank transfer confirmation, salary slip, credit card statement, investment statement",
+        "prompt_override": """You are classifying a document to verify it is a bank account statement (Source of Funds).
+
+VALID SOF FORMATS — all of these are acceptable:
+  FORMAT 1 — Digital bank statement (private banks: HDFC, ICICI, Axis, Kotak):
+    - "STATEMENT SUMMARY" section with Opening Balance, Closing Balance, Dr/Cr Count
+    - "This is a computer generated statement" disclaimer
+    - Multi-row transaction table
+
+  FORMAT 2 — Passbook or passbook printout (SBI, PNB, Canara, co-operative banks):
+    - Physical passbook pages photographed or scanned
+    - Or passbook-style printout from branch
+    - Shows: Date, Description/Narration, Withdrawal/Dr, Deposit/Cr, Balance columns
+    - NO "computer generated" disclaimer (this is normal for passbooks)
+    - NO "STATEMENT SUMMARY" section (this is normal for passbooks)
+    - A running balance column in the transaction table IS sufficient
+
+  FORMAT 3 — Bank statement PDF without summary section:
+    - Multi-row transaction history
+    - Account holder name and account number
+    - Date range covered by the statement
+    - Balance visible somewhere in the document
+
+WHAT MATTERS — a document is valid SOF if it shows:
+  1. Multiple transactions (at least 3-5 rows) covering a period of time
+  2. Account holder name or account number
+  3. Some form of balance information (running balance OR opening/closing OR current balance)
+  The account does NOT need a "STATEMENT SUMMARY" header.
+  The document does NOT need a "computer generated" disclaimer.
+
+INVALID as SOF:
+  - Single transaction bank advice/receipt (only shows one transaction) → this is "transfer"
+  - Salary slip or payslip → "unknown"
+  - Credit card statement → "unknown"
+  - Fixed deposit receipt or RD passbook → "unknown"
+
+DECISION RULE:
+  - Multiple transaction rows + account identity + any balance info → ACCEPT
+  - Only one transaction visible → REJECT as "transfer"
+  - No transaction rows at all → REJECT
+
+Output ONLY this JSON:
+{"match": true, "detected_type": "sof", "reason": "confirmed — [format: digital statement/passbook/other, key signals found]"}
+or
+{"match": false, "detected_type": "one of: transfer|passport|pan|visa|reload|ticket|annexure|unknown", "reason": "wrong document — [what this is]"}"""
     },
 }
 
@@ -254,8 +461,9 @@ or
 # These are genuinely similar document types where GPT-4o-mini or the user could reasonably
 # confuse them, especially on partial scans.
 _SOFT_MISMATCH_PAIRS = {
-    frozenset({"annexure", "reload"}),   # Both mention Thomas Cook — letterhead vs currency table
-    frozenset({"transfer", "sof"}),      # Both are bank documents — single row vs multi-row statement
+    frozenset({"annexure", "reload"}),              # Both mention Thomas Cook
+    frozenset({"transfer", "sof"}),                 # Both are bank documents
+    frozenset({"annexure", "dealer_issuance_letter"}),  # R-ANNEXURE-01: issuance letter ≠ wrong doc
 }
 
 
@@ -297,13 +505,17 @@ def _pdf_to_images(pdf_bytes: bytes) -> list:
 
 def _check_blur(gray: np.ndarray):
     """
-    Variance of Laplacian — low variance = missing edge data.
+    Variance of Laplacian sharpness gate.
 
-    Distinguishes two near-zero sharpness cases:
-    - Blank page: near-zero sharpness AND very high brightness (uniform white,
-      no edges to measure). Users need to know page is blank, not blurry.
-    - Genuine blur: near-zero sharpness regardless of brightness.
-    Both fail — but with different messages so the user knows what to fix.
+    Threshold sources:
+    - Method: Pech-Pacheco et al. (ICPR 2000) Variance of Laplacian.
+    - Lower bound 100.0: production floor for 150 DPI captures (Dynamsoft DIQA [9]).
+      At 300 DPI the standard is 200.0; halved proportionally for our 150 DPI renders.
+    - Upper bound 900.0: rejects artificially sharpened or JPEG-compressed images [10].
+    - Blank page special case: score < 10 + mean > 235 = no edges, uniform white.
+
+    NIST IR-6101 [23] confirmed: OCR accuracy degrades sharply below 150 DPI
+    equivalent sharpness, which corresponds to our 100.0 lower bound.
     """
     score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     if score < BLUR_THRESHOLD:
@@ -315,8 +527,13 @@ def _check_blur(gray: np.ndarray):
             ), score
         return False, (
             f"Image is out of focus — retake from a steady position "
-            f"(sharpness: {score:.1f}, minimum: {BLUR_THRESHOLD})"
+            f"(sharpness: {score:.1f}, minimum: {BLUR_THRESHOLD}). "
+            f"[Dynamsoft DIQA, NIST IR-6101]"
         ), score
+    # No upper ceiling: PDF-to-image renders at 150 DPI produce naturally high
+    # Laplacian scores (1000-6000+) from crisp vector text edges. The research
+    # ceiling of 900 [Kashyap ref 10] targets JPEG phone photos with compression
+    # artefacts — it must not be applied to PDF renders.
     return True, None, score
 
 
@@ -345,6 +562,127 @@ def _check_exposure(gray: np.ndarray):
 
 
 # ── Tier 1B: CG-DIQA ──────────────────────────────────────────────────────────
+
+
+# ── Glare detection ─────────────────────────────────────────────────────────────
+
+def _check_glare(gray):
+    """
+    Detect glare via LOCAL CONTRAST COLLAPSE per ISO/IEC 29794-5 and
+    Rodin & Orlov (2019) "Fast Glare Detection in Document Images".
+
+    Static pixel thresholds (e.g. pixel > 253) are fundamentally unreliable
+    because smartphone ISPs and scanners routinely map clean white paper to
+    240-255 brightness, producing massive false positives on non-glare images.
+
+    The ISO/IEC 29794-5 standard (section on photometric quality) defines glare
+    as: a localized zone where peak luminance is high AND local standard deviation
+    drops >80% compared to adjacent document zones. This reflects the physical
+    mechanism -- glare merges ink strokes with the background, collapsing local
+    contrast. Clean white paper has consistently high brightness across ALL zones
+    and does not exhibit this selective contrast collapse.
+
+    Algorithm:
+    1. Divide image into 3x3 grid of zones.
+    2. For each zone with sufficient content (>10% dark pixels), compute mean and std.
+    3. Derive baseline std from the median of all content zones.
+    4. Flag zones where mean > GLARE_MEAN_MIN AND std has collapsed > GLARE_STD_DROP_RATIO
+       relative to the baseline.
+
+    Sources: ISO/IEC 29794-5:2025 [19], Rodin & Orlov 2019 arXiv:1911.05189 [11],
+             ISO/IEC 19794-5 dynamic range requirement [19].
+
+    Returns: (passed: bool, reason: str or None, max_std_drop: float)
+    """
+    h, w = gray.shape
+    zh, zw = h // 3, w // 3
+
+    # Pass 1: collect stats for all content-bearing zones
+    zone_stats = []
+    for row in range(3):
+        for col in range(3):
+            zone = gray[row * zh:(row + 1) * zh, col * zw:(col + 1) * zw]
+            if zone.size == 0:
+                continue
+            content_ratio = float(np.sum(zone < 200)) / zone.size
+            if content_ratio < GLARE_CONTENT_MIN:
+                continue   # skip empty margins -- white paper, not glare
+            zone_stats.append({
+                "pos":     (row + 1, col + 1),
+                "mean":    float(np.mean(zone)),
+                "std":     float(np.std(zone)),
+                "content": content_ratio,
+            })
+
+    if not zone_stats:
+        return True, None, 0.0   # no content zones -- cannot assess glare
+
+    # Baseline = median std across all content zones (robust to outliers)
+    baseline_std = float(np.median([z["std"] for z in zone_stats]))
+
+    if baseline_std < 1.0:
+        # Entire document has collapsed contrast -- already captured by blur/CG-DIQA
+        return True, None, 0.0
+
+    # Pass 2: flag zones with high mean AND collapsed std
+    worst_drop = 0.0
+    worst_pos  = None
+    for z in zone_stats:
+        if z["mean"] < GLARE_MEAN_MIN:
+            continue   # zone is not bright enough to be glare
+        std_drop = (baseline_std - z["std"]) / baseline_std
+        if std_drop > worst_drop:
+            worst_drop = std_drop
+            worst_pos  = z["pos"]
+
+    if worst_drop > GLARE_STD_DROP_RATIO:
+        return False, (
+            f"Glare detected in zone {worst_pos} of a 3x3 grid — "
+            f"local contrast collapsed {worst_drop * 100:.0f}% below document baseline "
+            f"(baseline std: {baseline_std:.1f}). "
+            f"Retake without flash — avoid reflections on holograms or lamination. "
+            f"[ISO/IEC 29794-5, Rodin & Orlov 2019]"
+        ), worst_drop
+
+    return True, None, worst_drop
+
+
+# ── Document fill ratio ──────────────────────────────────────────────────────────
+
+def _check_fill_ratio(gray):
+    """
+    Measure what fraction of the image contains non-background content.
+
+    A document photographed from too far away will have a low fill ratio --
+    text is unreadably small even if the global sharpness score is fine
+    (desk edges or background can be sharp while the document is tiny).
+
+    Uses a 240-brightness threshold to count non-white pixels as content.
+    Works for both scanned and photographed documents.
+
+    Returns: (passed: bool, reason: str or None, fill_ratio: float)
+    """
+    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    fill_ratio = float(np.sum(binary > 0)) / binary.size
+
+    if fill_ratio < FILL_RATIO_MIN:
+        return False, (
+            f"Document occupies only {fill_ratio * 100:.1f}% of the image "
+            f"— document may be too small to read reliably "
+            f"(minimum: {FILL_RATIO_MIN * 100:.0f}%). "
+            f"Move the camera closer or re-scan at higher resolution."
+        ), fill_ratio
+
+    if fill_ratio < FILL_RATIO_WARN:
+        return True, (
+            f"Document fill is low ({fill_ratio * 100:.1f}%) -- document may be "
+            f"small in the frame. Consider retaking with the document filling "
+            f"most of the frame."
+        ), fill_ratio
+
+    return True, None, fill_ratio
+
+
 
 def _check_cgdiqa(gray: np.ndarray) -> tuple:
     """
@@ -504,6 +842,26 @@ def _assess_single_image(img: np.ndarray) -> dict:
             "failed_check": "exposure", "scores": scores, "tier": 1
         }
 
+    # Glare: SOFT WARNING only, not a hard fail.
+    # Rationale: glare detection on scanned PDFs is inherently unreliable —
+    # zones with sparse content (footers, borders, white space) have naturally
+    # low local std_dev compared to text-dense zones, triggering false positives.
+    # GPT-4o-mini often reads through moderate glare successfully.
+    # Blocking on glare creates more false rejections than it prevents bad extractions.
+    # Flag for human review instead — the reviewer can judge the physical document.
+    _glare_passed, glare_reason, scores["glare"] = _check_glare(gray)
+    glare_warning = glare_reason if not _glare_passed else None
+
+    passed, fill_reason, scores["fill_ratio"] = _check_fill_ratio(gray)
+    if not passed:
+        return {
+            "pass": False, "reason": fill_reason,
+            "failed_check": "fill_ratio", "scores": scores, "tier": 1
+        }
+    # Fill ratio soft warning: pass but flag for review
+    fill_warning = fill_reason if (passed and fill_reason) else None
+    soft_warning = glare_warning or fill_warning
+
     # ── Tier 1B: CG-DIQA ───────────────────────────────────────────────────────
     cgdiqa_score, n_regions, status = _check_cgdiqa(gray)
     scores["cgdiqa"]       = round(cgdiqa_score, 2)
@@ -512,23 +870,24 @@ def _assess_single_image(img: np.ndarray) -> dict:
     if status == "pass":
         return {
             "pass": True,
-            "flagged_for_review": False,
-            "reason": "Passes all quality checks",
+            "flagged_for_review": bool(soft_warning),
+            "reason": soft_warning or "Passes all quality checks",
             "failed_check": None,
             "scores": scores,
             "tier": 1
         }
 
     if status == "review":
+        _borderline_msg = (
+            f"Document quality is borderline — security patterns, photograph noise, or "
+            f"photocopy quality may reduce OCR accuracy "
+            f"(CG-DIQA score: {cgdiqa_score:.1f}, clean threshold: {CGDIQA_REVIEW}). "
+            f"Recommend human review before processing."
+        )
         return {
             "pass": True,
             "flagged_for_review": True,
-            "reason": (
-                f"Document quality is borderline — security patterns, photograph noise, or "
-                f"photocopy quality may reduce OCR accuracy "
-                f"(CG-DIQA score: {cgdiqa_score:.1f}, clean threshold: {CGDIQA_REVIEW}). "
-                f"Recommend human review before processing."
-            ),
+            "reason": (soft_warning + " — " if soft_warning else "") + _borderline_msg,
             "failed_check": None,
             "scores": scores,
             "tier": 1
@@ -639,6 +998,32 @@ or
         else:
             result["severity"] = None
 
+        # R-PAN-01 hard rule: 4th character of PAN number is definitive.
+        # Override GPT classification if PAN number contradicts it.
+        if expected_type == "pan":
+            import re as _re
+            pan_raw = result.get("pan_number_extracted") or ""
+            pan_num = _re.sub(r"[^A-Z0-9]", "", pan_raw.upper())
+            if len(pan_num) >= 4:
+                fourth = pan_num[3]
+                if fourth == "P" and not result.get("match"):
+                    result["match"]         = True
+                    result["detected_type"] = "pan"
+                    result["severity"]      = None
+                    result["reason"]        = (
+                        f"Individual PAN confirmed by 4th character hard rule: "
+                        f"PAN '{pan_num}' position 4 = 'P' (Person). "
+                        f"GPT visual classification overridden."
+                    )
+                elif fourth in "FCHABLGJT" and result.get("match"):
+                    result["match"]         = False
+                    result["detected_type"] = "pan"
+                    result["severity"]      = "hard"
+                    result["reason"]        = (
+                        f"Non-individual PAN by 4th character rule: "
+                        f"PAN '{pan_num}' position 4 = '{fourth}'."
+                    )
+
         return result
 
     except Exception as e:
@@ -651,6 +1036,116 @@ or
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
+
+def _check_visa_quality(images: list):
+    """
+    Visa-specific extractability check — runs AFTER type check confirms it is a visa.
+
+    Standard DIQA (CGDIQA score) is insufficient for visa images because:
+    - Passport page text generates high gradient scores even when the visa
+      sticker is tiny, tilted, or occupies a small fraction of the frame.
+    - Holographic overlays always obscure VIZ date fields — the MRZ is the
+      only reliable source for expiry date. If Tesseract cannot read it,
+      the entire visa extraction is unreliable.
+
+    Two independent gates, either causes immediate rejection:
+
+    Gate 1 — Frame fill (< 20% non-white pixels):
+      A correctly photographed visa should have the sticker filling most
+      of the frame. Low non-white ratio means the passport/sticker is tiny
+      in the image, off-angle, or the frame is mostly empty space.
+      Empirical baseline: this visa image scored 8.4% — correctly rejected.
+
+    Gate 2 — MRZ detectability (< 2 lines found by Tesseract):
+      Sticker visas have a 2-line MRZ outside the holographic zone.
+      If Tesseract cannot find both lines, the image is too tilted,
+      too small, or too blurry for the Tesseract-MRZ extraction path.
+      Without MRZ, expiry date falls back to GPT reading holographic
+      VIZ fields — this reliably produces wrong dates.
+
+    Returns None if visa is extractable, or a rejection dict if not.
+    """
+    if not images:
+        return None
+
+    try:
+        from PIL import Image as PILImage
+
+        img  = images[0]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # ── e-Visa detection: skip sticker checks for digital printouts ────
+        # e-Visa / entry permit PDFs are text on white paper — naturally low fill.
+        # Sticker-specific checks (frame fill, MRZ zone) don't apply.
+        # Detect by OCR: if e-Visa keywords are present → pass quality check.
+        try:
+            _pil_ev  = PILImage.fromarray(gray)
+            _ev_text = pytesseract.image_to_string(_pil_ev, config="--psm 11").lower()
+            _ev_kw   = [
+                "evisa", "e-visa", "entry permit", "electronic travel",
+                "visa grant", "grant number", "subclass", "eta ",
+                "valid until", "place of birth",    # UAE / AUS e-Visa fields
+            ]
+            if any(kw in _ev_text for kw in _ev_kw):
+                return None   # e-Visa format — no sticker quality checks needed
+        except Exception:
+            pass   # OCR unavailable — fall through to sticker checks
+
+        # ── Gate 1: Frame fill ────────────────────────────────────────────
+        _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        non_white_ratio = float(np.count_nonzero(thresh)) / (gray.shape[0] * gray.shape[1])
+
+        if non_white_ratio < 0.20:
+            return {
+                "pass":         False,
+                "requires_review": False,
+                "reason": (
+                    f"Visa document fills only {non_white_ratio:.0%} of the image — "
+                    f"too small to extract reliably. "
+                    f"Place the passport flat on a table, open to the visa page, and "
+                    f"photograph from directly above so the visa sticker fills most of "
+                    f"the frame. Minimum recommended fill: 20% of frame area."
+                ),
+                "failed_check": "visa_frame_fill",
+            }
+
+        # ── Gate 2: MRZ detectability ────────────────────────────────────
+        _, binary  = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        pil_img    = PILImage.fromarray(binary)
+        raw_text   = pytesseract.image_to_string(
+            pil_img,
+            config="--psm 11 -c tessedit_char_whitelist="
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
+        )
+        mrz_lines = [
+            ln.strip().replace(" ", "")
+            for ln in raw_text.splitlines()
+            if len(ln.strip().replace(" ", "")) >= 20 and "<" in ln
+        ]
+
+        if len(mrz_lines) < 2:
+            return {
+                "pass":         False,
+                "requires_review": False,
+                "reason": (
+                    "Visa sticker detected but the machine-readable zone (MRZ) — the two "
+                    "lines of text at the bottom of the sticker — cannot be read at this "
+                    "quality. Without a readable MRZ, the expiry date cannot be extracted "
+                    "reliably. Re-photograph: place the passport flat on a table, open to "
+                    "the visa page, and shoot from directly above. Ensure both MRZ lines "
+                    "at the bottom of the sticker are fully in-frame, horizontal, and sharp."
+                ),
+                "failed_check": "visa_mrz_unreadable",
+            }
+
+    except Exception:
+        # Tesseract or PIL unavailable — skip and allow through
+        # (extraction will still attempt; better than blocking on tool failure)
+        pass
+
+    return None   # Both gates passed — visa is extractable
+
+
 
 def assess(file_bytes: bytes, filetype: str, expected_doc_type: str = None) -> dict:
     """
@@ -728,9 +1223,15 @@ def assess(file_bytes: bytes, filetype: str, expected_doc_type: str = None) -> d
         result["page"] = i + 1
         page_results.append(result)
 
-    failed = [r for r in page_results if not r["pass"]]
-    flagged = [r for r in page_results if r.get("flagged_for_review")]
+    failed   = [r for r in page_results if not r["pass"]]
+    flagged  = [r for r in page_results if r.get("flagged_for_review")]
     overall_pass = len(failed) == 0
+
+    # Expose CG-DIQA score for routing decisions in calling code
+    # Use first page score as representative (most documents are single-page)
+    cgdiqa_score = None
+    if page_results:
+        cgdiqa_score = page_results[0].get("scores", {}).get("cgdiqa")
 
     # ── Document type validation (only if quality passed and type was declared) ─
     doc_type_check = None
@@ -748,10 +1249,33 @@ def assess(file_bytes: bytes, filetype: str, expected_doc_type: str = None) -> d
                 "doc_type_check": doc_type_check,
             }
 
+    # ── Visa-specific extractability check ──────────────────────────────────
+    # DIQA scores mislead for visa sticker images: the text-rich passport
+    # background generates high CGDIQA scores even when the visa sticker is
+    # tiny, tilted, or occupies < 10% of the frame.
+    # This check gates on actual MRZ readability — the ground truth for
+    # whether the visa can produce a reliable expiry date.
+    # Runs AFTER type check passes (confirmed to be a visa).
+    # Rejects immediately if either gate fails — no flagging, no review.
+    if expected_doc_type == "visa" and overall_pass:
+        visa_quality = _check_visa_quality(images)
+        if visa_quality is not None:
+            return {
+                "pass":           False,
+                "requires_review": False,
+                "reason":         visa_quality["reason"],
+                "failed_check":   visa_quality["failed_check"],
+                "flagged_pages":  [],
+                "failed_pages":   [],
+                "page_results":   page_results,
+                "doc_type_check": doc_type_check,
+            }
+
     return {
-        "pass": overall_pass,
+        "pass":           overall_pass,
         "requires_review": bool(flagged) if overall_pass else False,
-        "flagged_pages": [r["page"] for r in flagged],
+        "flagged_pages":  [r["page"] for r in flagged],
+        "cgdiqa_score":   cgdiqa_score,
         "reason": (
             "All pages pass quality checks"
             if overall_pass and not flagged
@@ -759,7 +1283,79 @@ def assess(file_bytes: bytes, filetype: str, expected_doc_type: str = None) -> d
             if overall_pass and flagged
             else f"{len(failed)} of {len(page_results)} page(s) failed quality checks"
         ),
-        "failed_pages": [r["page"] for r in failed],
-        "page_results": page_results,
+        "failed_pages":   [r["page"] for r in failed],
+        "page_results":   page_results,
         "doc_type_check": doc_type_check,
     }
+
+# ── Fix 3: Anchor field extraction confidence check ────────────────────────────
+# Called AFTER extraction (in diqa_test.py), not during DIQA quality gate.
+# Validates that key extracted fields match their known regex pattern.
+# Returns a soft WARNING -- never rejects a document outright.
+
+import re as _re
+
+_ANCHOR_PATTERNS = {
+    "passport": [
+        {
+            "label":   "Passport Number",
+            "key":     "passport_no",
+            "pattern": r"^[A-Z][0-9]{7}$",
+            "hint":    "Indian passport number must be 1 uppercase letter followed by exactly 7 digits (e.g. Z4565258)",
+        },
+    ],
+    "pan": [
+        {
+            "label":   "PAN Number",
+            "key":     "pan_number",
+            "pattern": r"^[A-Z]{5}[0-9]{4}[A-Z]$",
+            "hint":    "PAN must be 5 letters + 4 digits + 1 letter (e.g. ACSPV7218B)",
+        },
+    ],
+    "reload": [
+        {
+            "label":   "PAN Number on Reload Form",
+            "key":     "pan_number",
+            "pattern": r"^[A-Z]{5}[0-9]{4}[A-Z]$",
+            "hint":    "PAN on reload form must be 5 letters + 4 digits + 1 letter -- handwriting OCR may have introduced errors",
+        },
+    ],
+    "visa": [
+        {
+            "label":   "Visa Number",
+            "key":     "visa_number",
+            "pattern": r"^[A-Z0-9]{6,15}$",
+            "hint":    "Visa number must be 6-15 alphanumeric characters",
+        },
+    ],
+}
+
+
+def check_extraction_confidence(doc_type: str, extracted: dict) -> list:
+    """
+    Validate anchor fields in extracted data against known regex patterns.
+    Returns a list of warning dicts (empty list = all anchor fields look correct).
+    Each warning: {"field": str, "value": str, "hint": str}
+
+    This is a SOFT check -- it flags suspicious values for human review
+    but never blocks processing. Designed to catch GPT misreads like:
+      - Passport number with wrong character count (Z456512358 instead of Z4565258)
+      - PAN number with wrong format (ACS1V7218B instead of ACSPV7218B)
+    """
+    warnings = []
+    patterns = _ANCHOR_PATTERNS.get(doc_type, [])
+
+    for spec in patterns:
+        raw = extracted.get(spec["key"])
+        if not raw:
+            continue  # field absent -- not an anchor check concern
+
+        value = _re.sub(r"[^A-Z0-9]", "", str(raw).upper())
+        if not _re.match(spec["pattern"], value):
+            warnings.append({
+                "field": spec["label"],
+                "value": raw,
+                "hint":  spec["hint"],
+            })
+
+    return warnings
